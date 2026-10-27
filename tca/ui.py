@@ -622,6 +622,63 @@ class _CredentialForm:
             self._note.pack_forget()
 
 
+class _FadingNote:
+    """A status line that stays readable, then fades into the card."""
+
+    def __init__(self, note: tk.Label, on_changed: Callable[[], None]) -> None:
+        self._note = note
+        self._on_changed = on_changed
+        self._note_color = _TONES["ok"]
+        self._fade_after: str | None = None
+
+    def set(self, text: str, *, ok: bool = False) -> None:
+        self._cancel()
+        if not text:
+            if self._note.winfo_ismapped():
+                self._note.pack_forget()
+            return
+        self._note_color = _TONES["ok"] if ok else _TONES["bad"]
+        self._note.configure(text=text, fg=self._note_color)
+        if not self._note.winfo_ismapped():
+            self._note.pack(fill="x", pady=(6, 0))
+        self._fade_after = self._note.after(_NOTE_HOLD_MS, self._fade_step)
+
+    def _fade_step(self, step: int = 1) -> None:
+        self._fade_after = None
+        try:
+            if not self._note.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        if step > _NOTE_FADE_STEPS:
+            if self._note.winfo_ismapped():
+                self._note.pack_forget()
+            self._on_changed()
+            return
+        self._note.configure(fg=_blend(self._note_color, _CARD, step / _NOTE_FADE_STEPS))
+        self._fade_after = self._note.after(
+            _NOTE_FADE_MS // _NOTE_FADE_STEPS,
+            lambda next_step=step + 1: self._fade_step(next_step),
+        )
+
+    def _cancel(self) -> None:
+        after_id = self._fade_after
+        self._fade_after = None
+        if after_id is None:
+            return
+        try:
+            self._note.after_cancel(after_id)
+        except tk.TclError:
+            return
+
+
+def _blend(start: str, end: str, amount: float) -> str:
+    def channel(first: str, second: str) -> int:
+        return round(int(first, 16) + (int(second, 16) - int(first, 16)) * amount)
+
+    return f"#{channel(start[1:3], end[1:3]):02x}{channel(start[3:5], end[3:5]):02x}{channel(start[5:7], end[5:7]):02x}"
+
+
 class _RequestPanel:
     """Song requests still waiting, each with a way to drop it from the list."""
 
@@ -629,8 +686,6 @@ class _RequestPanel:
         self._requests = requests
         self._on_changed = on_changed
         self._shown: tuple[tuple[int, str, str, str, str], ...] | None = None
-        self._note_color = _TONES["ok"]
-        self._fade_after: str | None = None
         self.frame = tk.Frame(
             parent,
             bg=_CARD,
@@ -664,6 +719,7 @@ class _RequestPanel:
             justify="left",
             wraplength=470,
         )
+        self._fading = _FadingNote(self._note, on_changed)
 
     def sync(self) -> None:
         shown = self._requests.snapshot()
@@ -718,51 +774,7 @@ class _RequestPanel:
         self._on_changed()
 
     def _set_note(self, text: str, *, ok: bool = False) -> None:
-        self._cancel_fade()
-        if not text:
-            if self._note.winfo_ismapped():
-                self._note.pack_forget()
-            return
-        self._note_color = _TONES["ok"] if ok else _TONES["bad"]
-        self._note.configure(text=text, fg=self._note_color)
-        if not self._note.winfo_ismapped():
-            self._note.pack(fill="x", pady=(6, 0))
-        self._fade_after = self._note.after(_NOTE_HOLD_MS, self._fade_step)
-
-    def _fade_step(self, step: int = 1) -> None:
-        self._fade_after = None
-        try:
-            if not self._note.winfo_exists():
-                return
-        except tk.TclError:
-            return
-        if step > _NOTE_FADE_STEPS:
-            if self._note.winfo_ismapped():
-                self._note.pack_forget()
-            self._on_changed()
-            return
-        self._note.configure(fg=_blend(self._note_color, _CARD, step / _NOTE_FADE_STEPS))
-        self._fade_after = self._note.after(
-            _NOTE_FADE_MS // _NOTE_FADE_STEPS,
-            lambda next_step=step + 1: self._fade_step(next_step),
-        )
-
-    def _cancel_fade(self) -> None:
-        after_id = self._fade_after
-        self._fade_after = None
-        if after_id is None:
-            return
-        try:
-            self._note.after_cancel(after_id)
-        except tk.TclError:
-            return
-
-
-def _blend(start: str, end: str, amount: float) -> str:
-    def channel(first: str, second: str) -> int:
-        return round(int(first, 16) + (int(second, 16) - int(first, 16)) * amount)
-
-    return f"#{channel(start[1:3], end[1:3]):02x}{channel(start[3:5], end[3:5]):02x}{channel(start[5:7], end[5:7]):02x}"
+        self._fading.set(text, ok=ok)
 
 
 class _CommandPanel:
@@ -824,6 +836,7 @@ class _CommandPanel:
             justify="left",
             wraplength=470,
         )
+        self._fading = _FadingNote(self._note, on_changed)
 
     def sync(self) -> None:
         text = tuple(self._commands.text_commands())
@@ -915,12 +928,7 @@ class _CommandPanel:
         self._on_changed()
 
     def _set_note(self, text: str, *, ok: bool = False) -> None:
-        if text:
-            self._note.configure(text=text, fg=_TONES["ok"] if ok else _TONES["bad"])
-            if not self._note.winfo_ismapped():
-                self._note.pack(fill="x", pady=(6, 0))
-        elif self._note.winfo_ismapped():
-            self._note.pack_forget()
+        self._fading.set(text, ok=ok)
 
 
 def _short_reply(text: str, limit: int = 42) -> str:
