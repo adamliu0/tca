@@ -1,0 +1,9 @@
+.venv/
+.env
+config.json
+config.json.tmp
+.tio.tokens.json
+.spotify_cache
+__pycache__/
+*.pyc
+.pytest_cache/

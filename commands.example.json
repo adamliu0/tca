@@ -1,0 +1,10 @@
+{
+  "cooldown_seconds": 10,
+  "!discord": "https://discord.gg/example",
+  "!song": {
+    "handler": "spotify_song"
+  },
+  "!playlist": {
+    "handler": "spotify_playlist"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "cooldown_seconds": 10,
+  "!song": {
+    "handler": "spotify_song"
+  },
+  "!playlist": {
+    "handler": "spotify_playlist"
+  }
+}
