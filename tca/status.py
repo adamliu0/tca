@@ -109,6 +109,18 @@ class AppStatus:
             twitch_can_link=False,
         )
 
+    def note_twitch_reauth(self, message: str) -> None:
+        self.update(twitch_detail=message, twitch_can_link=True)
+
+    def clear_twitch_reauth(self) -> None:
+        with self._lock:
+            if self._snapshot.twitch_state != "connected":
+                return
+            self._snapshot = replace(self._snapshot, twitch_detail="", twitch_can_link=False)
+
+    def note_spotify_reauth(self, message: str) -> None:
+        self.update(spotify_detail=message, spotify_can_link=True)
+
     def mark_spotify_unlinked(self, detail: str = "") -> None:
         self.update(spotify_state="not_connected", spotify_detail=detail, spotify_can_link=True)
 
@@ -190,7 +202,8 @@ def status_rows(snapshot: Snapshot) -> list[StatusRow]:
 def _link_button(state: str, can_link: bool, label: str) -> tuple[str | None, bool]:
     if state == "linking":
         return "Waiting…", False
-    if can_link and state in {"not_connected", "error"}:
-        again = "Link again" if state == "error" else label
-        return again, True
+    if can_link and state == "not_connected":
+        return label, True
+    if can_link and state in {"error", "connected"}:
+        return "Link again", True
     return None, False

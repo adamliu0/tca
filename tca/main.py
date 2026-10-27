@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import multiprocessing
 import os
 import socket
 import sys
@@ -16,6 +17,7 @@ from pathlib import Path
 from tca.bot import AUTH_PORT, AUTH_URL, Autoreply
 from tca.commands import CommandFile, CommandFileError
 from tca.config_store import Config, load_config, save_config, saved_twitch_user_id
+from tca.request_log import RequestBoard, RequestLog
 from tca.spotify import REDIRECT_URI, SpotifyNow, SpotifyUnavailable
 from tca.status import AppStatus
 from tca.ui import StatusWindow
@@ -24,6 +26,9 @@ logger = logging.getLogger("tca")
 
 
 def project_root() -> Path:
+    """Folder for config and saved logins. Next to TCA.exe when the app is packaged."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent
 
 
@@ -33,7 +38,9 @@ class Runtime:
     config_path: Path
     config: Config
     commands: CommandFile
+    requests: RequestLog
     status: AppStatus
+    request_board: RequestBoard | None = None
     spotify: SpotifyNow | None = None
     service: BotService | None = None
 
@@ -95,7 +102,21 @@ class Runtime:
     def link_twitch(self) -> None:
         _link_twitch(self.status)
 
+    def queue_ids(self) -> list[str] | None:
+        spotify = self.spotify
+        if spotify is None:
+            return []
+        try:
+            return spotify.upcoming_track_ids()
+        except SpotifyUnavailable:
+            return None
+
+    def start_request_board(self) -> None:
+        self.request_board = RequestBoard(self.requests, self.queue_ids)
+
     def stop(self) -> None:
+        if self.request_board is not None:
+            self.request_board.stop()
         if self.service is not None:
             self.service.stop()
 
@@ -120,6 +141,7 @@ class Runtime:
             commands=self.commands,
             status=self.status,
             user_id=saved_twitch_user_id(self.root / ".tio.tokens.json"),
+            requests=self.requests,
         )
         if self.spotify is not None:
             self.service.attach_spotify(self.spotify)
@@ -135,12 +157,14 @@ class BotService:
         commands: CommandFile,
         status: AppStatus,
         user_id: str | None,
+        requests: RequestLog,
     ) -> None:
         self.client_id = client_id
         self.client_secret = client_secret
         self.commands = commands
         self.status = status
         self.user_id = user_id
+        self.requests = requests
         self.spotify: SpotifyNow | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -201,6 +225,7 @@ class BotService:
             client_id=self.client_id,
             client_secret=self.client_secret,
             bot_id=self.user_id,
+            requests=self.requests,
         )
         with self._guard:
             self._bot = bot
@@ -210,14 +235,11 @@ class BotService:
 
 
 def main() -> None:
-    _console_utf8()
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    multiprocessing.freeze_support()
     root = project_root()
     os.chdir(root)
+    _console_utf8()
+    _configure_logging(root)
     status = AppStatus()
 
     try:
@@ -233,15 +255,19 @@ def main() -> None:
         config_path=config_path,
         config=load_config(config_path),
         commands=commands,
+        requests=RequestLog(root / ".song_requests.json"),
         status=status,
     )
     runtime.apply_startup()
+    runtime.start_request_board()
     window = StatusWindow(
         status,
         on_link_twitch=runtime.link_twitch,
         on_link_spotify=runtime.link_spotify,
         on_save_twitch=runtime.save_twitch,
         on_save_spotify=runtime.save_spotify,
+        commands=runtime.commands,
+        requests=runtime.request_board,
     )
     window.prefill(
         twitch_id=runtime.config.twitch_client_id,
@@ -266,10 +292,9 @@ def _check_spotify(spotify: SpotifyNow | None, status: AppStatus) -> None:
         _spotify_failure(status, exc)
         return
     if linked:
-        logger.info("Spotify is signed in.")
-        status.mark_spotify_connected()
+        _note_spotify_permissions(spotify, status)
     else:
-        status.mark_spotify_unlinked()
+        _spotify_signed_out(spotify, status)
 
 
 def _finish_spotify_setup(spotify: SpotifyNow, status: AppStatus) -> None:
@@ -280,8 +305,7 @@ def _finish_spotify_setup(spotify: SpotifyNow, status: AppStatus) -> None:
         _spotify_failure(status, exc)
         return
     if linked:
-        logger.info("Spotify is signed in.")
-        status.mark_spotify_connected()
+        _note_spotify_permissions(spotify, status)
         return
     _link_spotify(spotify, status)
 
@@ -300,8 +324,7 @@ def _link_spotify(spotify: SpotifyNow, status: AppStatus) -> None:
             logger.exception("Spotify link failed")
             status.mark_spotify_error("Spotify login failed. Try again.")
             return
-        logger.info("Spotify is signed in.")
-        status.mark_spotify_connected()
+        _note_spotify_permissions(spotify, status)
 
     threading.Thread(target=worker, name="tca-spotify-link", daemon=True).start()
 
@@ -314,8 +337,27 @@ def _spotify_failure(status: AppStatus, exc: SpotifyUnavailable) -> None:
     status.mark_spotify_error(str(exc) or "Spotify login failed. Try again.")
 
 
+def _spotify_signed_out(spotify: SpotifyNow, status: AppStatus) -> None:
+    if spotify.has_cached_login() and not spotify.has_queue_permission():
+        status.mark_spotify_unlinked("Link Spotify again so the song queue can be read.")
+        return
+    status.mark_spotify_unlinked()
+
+
+def _note_spotify_permissions(spotify: SpotifyNow, status: AppStatus) -> None:
+    if spotify.has_queue_permission():
+        logger.info("Spotify is signed in.")
+        status.mark_spotify_connected()
+        return
+    logger.info("Spotify is signed in without permission to read the queue.")
+    status.mark_spotify_connected()
+    status.note_spotify_reauth("Link Spotify again so the song queue can be read.")
+
+
 def _link_twitch(status: AppStatus) -> None:
-    force = status.snapshot().twitch_state == "error"
+    snapshot = status.snapshot()
+    # A connected account that still needs a new permission must see Twitch's approval page again.
+    force = snapshot.twitch_state == "error" or (snapshot.twitch_state == "connected" and snapshot.twitch_can_link)
     url = f"{AUTH_URL}?force_verify=true" if force else AUTH_URL
 
     def worker() -> None:
@@ -343,6 +385,20 @@ def _oauth_port_is_open() -> bool:
                 continue
         time.sleep(0.1)
     return False
+
+
+def _configure_logging(root: Path) -> None:
+    handlers: list[logging.Handler] = []
+    if getattr(sys, "frozen", False):
+        handlers.append(logging.FileHandler(root / "tca.log", encoding="utf-8"))
+    else:
+        handlers.append(logging.StreamHandler())
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+        handlers=handlers,
+    )
 
 
 def _console_utf8() -> None:

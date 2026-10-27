@@ -39,6 +39,21 @@ class StatusRowTests(unittest.TestCase):
         self.assertEqual(spotify.button, "Waiting…")
         self.assertFalse(spotify.button_enabled)
 
+    def test_reauth_keeps_the_program_running(self) -> None:
+        status = AppStatus()
+        status.mark_listening("example")
+        status.mark_spotify_connected()
+        status.note_twitch_reauth("Link Twitch again so song requests can be read.")
+        status.note_spotify_reauth("Link Spotify again so song requests can be queued.")
+        rows = {row.name: row for row in status_rows(status.snapshot())}
+
+        self.assertEqual(rows["Program"].value, "Running")
+        self.assertEqual(rows["Twitch"].value, "Connected")
+        self.assertEqual(rows["Twitch"].button, "Link again")
+        self.assertIn("song requests", rows["Twitch"].detail)
+        self.assertEqual(rows["Spotify"].value, "Connected")
+        self.assertEqual(rows["Spotify"].button, "Link again")
+
     def test_problem_offers_link_again(self) -> None:
         status = AppStatus()
         status.mark_twitch_error("Twitch did not allow chat access.", can_link=True)

@@ -13,7 +13,9 @@ from twitchio.exceptions import HTTPException
 
 from tca.commands import Command, CommandFile, HandlerCommand, TextCommand, on_cooldown
 from tca.replies import ReplyMemory, clamp_message
-from tca.spotify import SpotifyNow, SpotifyUnavailable
+from tca.request_log import RequestLog, SongRequest, format_request_queue
+from tca.song_request import is_song_request_reward, track_id_from_text
+from tca.spotify import QueuedTrack, SpotifyNow, SpotifyUnavailable
 from tca.status import AppStatus
 
 logger = logging.getLogger("tca")
@@ -34,8 +36,13 @@ class Autoreply(twitchio.Client):
         client_id: str,
         client_secret: str,
         bot_id: str | None,
+        requests: RequestLog,
     ) -> None:
-        scopes = twitchio.Scopes(user_read_chat=True, user_write_chat=True)
+        scopes = twitchio.Scopes(
+            user_read_chat=True,
+            user_write_chat=True,
+            channel_read_redemptions=True,
+        )
         super().__init__(
             client_id=client_id,
             client_secret=client_secret,
@@ -51,10 +58,14 @@ class Autoreply(twitchio.Client):
         self._recent = ReplyMemory()
         self._cooldowns: dict[str, float] = {}
         self._listening = False
+        self._song_requests = False
+        self._redemptions = ReplyMemory(limit=200)
         self._spotify_lock = asyncio.Lock()
+        self._requests = requests
         self._handlers: dict[str, Callable[[], str]] = {
             "spotify_song": self._song_reply,
             "spotify_playlist": self._playlist_reply,
+            "spotify_queue": self._queue_reply,
         }
 
     def _song_reply(self) -> str:
@@ -68,6 +79,13 @@ class Autoreply(twitchio.Client):
         if spotify is None:
             raise SpotifyUnavailable("Spotify is not set up yet. Add it in the TCA window.")
         return spotify.playlist_reply()
+
+    def _queue_reply(self) -> str:
+        spotify = self.spotify
+        if spotify is None:
+            raise SpotifyUnavailable("Spotify is not set up yet. Add it in the TCA window.")
+        waiting = self._requests.upcoming(spotify.upcoming_track_ids())
+        return format_request_queue(waiting)
 
     async def setup_hook(self) -> None:
         self._remember_login()
@@ -128,28 +146,78 @@ class Autoreply(twitchio.Client):
         except SpotifyUnavailable as exc:
             logger.exception("Spotify request failed")
             if exc.needs_login:
-                self.status.mark_spotify_unlinked("Spotify needs to be linked again.")
-            reply = "Spotify isn't available right now."
+                self.status.note_spotify_reauth(str(exc) or "Link Spotify again.")
+                reply = str(exc) or "Spotify needs to be linked again."
+            else:
+                reply = "Spotify isn't available right now."
 
-        reply = clamp_message(reply)
-        if not reply:
+        self._cooldowns[name] = now
+        if await self._say(reply):
+            logger.info("Replied to %s from %s: %s", name, _chatter_name(payload), clamp_message(reply))
+
+    async def event_custom_redemption_add(self, payload: twitchio.ChannelPointsRedemptionAdd) -> None:
+        # Chat messages are handled above and never reach this. A Spotify link in chat is not queued.
+        if payload.status == "canceled":
+            return
+        reward = payload.reward.title
+        user_input = payload.user_input or ""
+        if not is_song_request_reward(reward):
+            if track_id_from_text(user_input):
+                logger.info("Ignored a Spotify link from the %r reward. Only Spotify Song Request is queued.", reward)
+            return
+        if self._redemptions.seen(payload.id):
+            return
+        self._redemptions.remember(payload.id)
+        viewer = payload.user.name or payload.user.id
+        track_id = track_id_from_text(user_input)
+        if track_id is None:
+            logger.info("Song request from %s had no Spotify song link.", viewer)
+            await self._say("That song request needs a Spotify song link.")
+            return
+        try:
+            async with self._spotify_lock:
+                queued = await asyncio.to_thread(self._queue_track, track_id)
+                self._requests.add(
+                    SongRequest(
+                        track_id=queued.track_id,
+                        title=queued.title,
+                        artist=queued.artist,
+                        viewer=viewer,
+                    )
+                )
+        except SpotifyUnavailable as exc:
+            logger.exception("Could not queue a song request from %s", viewer)
+            if exc.needs_login:
+                self.status.note_spotify_reauth("Link Spotify again so song requests can be queued.")
+            await self._say(str(exc) or "Spotify isn't available right now.")
             return
 
+        if await self._say(f"Queued: {queued.label}"):
+            logger.info("Queued %s for %s.", queued.label, viewer)
+
+    def _queue_track(self, track_id: str) -> QueuedTrack:
+        spotify = self.spotify
+        if spotify is None:
+            raise SpotifyUnavailable("Spotify is not set up yet. Add it in the TCA window.")
+        return spotify.queue_track(track_id)
+
+    async def _say(self, text: str) -> bool:
+        reply = clamp_message(text)
+        if not reply:
+            return False
         # Record the reply before sending so the echo of this message cannot run another command.
         self._recent.remember(reply)
-        self._cooldowns[name] = now
         if not self.bot_id:
             logger.error("No Twitch user id is set, so the reply was not sent.")
-            return
-
+            return False
         channel = self.create_partialuser(self.bot_id)
         try:
             # HTTPS request to Twitch. This does not type into chat or touch the keyboard.
             await channel.send_message(reply, self.bot_id, token_for=self.bot_id)
         except (HTTPException, twitchio.MessageRejectedError):
-            logger.exception("Twitch rejected the reply to %s", name)
-            return
-        logger.info("Replied to %s from %s: %s", name, _chatter_name(payload), reply)
+            logger.exception("Twitch rejected a reply")
+            return False
+        return True
 
     def _build_reply(self, command: Command) -> str:
         if isinstance(command, TextCommand):
@@ -162,7 +230,10 @@ class Autoreply(twitchio.Client):
         return "That command is not set up."
 
     async def _listen(self) -> None:
-        if self._listening or not self.bot_id or self.bot_id not in self.tokens:
+        if not self.bot_id or self.bot_id not in self.tokens:
+            return
+        if self._listening:
+            await self._listen_for_song_requests()
             return
         try:
             await self.subscribe_websocket(
@@ -182,6 +253,27 @@ class Autoreply(twitchio.Client):
         account = self.account or "your account"
         self.status.mark_listening(account)
         logger.info("Listening in %s's chat.", account)
+        await self._listen_for_song_requests()
+
+    async def _listen_for_song_requests(self) -> None:
+        if self._song_requests or not self.bot_id:
+            return
+        try:
+            await self.subscribe_websocket(
+                eventsub.ChannelPointsRedeemAddSubscription(broadcaster_user_id=self.bot_id),
+                token_for=self.bot_id,
+            )
+        except HTTPException as exc:
+            if exc.status in {401, 403}:
+                message = "Link Twitch again so song requests can be read."
+                logger.warning(message)
+                self.status.note_twitch_reauth(message)
+                return
+            logger.exception("Twitch did not allow song request redemptions.")
+            return
+        self._song_requests = True
+        self.status.clear_twitch_reauth()
+        logger.info("Listening for Spotify Song Request redemptions.")
 
     def _remember_login(self) -> None:
         user = self.user

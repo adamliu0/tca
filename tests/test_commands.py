@@ -3,7 +3,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tca.commands import CommandFile, CommandFileError, HandlerCommand, TextCommand, on_cooldown, parse_commands
+from tca.commands import (
+    CommandFile,
+    CommandFileError,
+    HandlerCommand,
+    TextCommand,
+    command_name,
+    on_cooldown,
+    parse_commands,
+)
 
 
 class CommandTests(unittest.TestCase):
@@ -59,12 +67,51 @@ class CommandTests(unittest.TestCase):
             self.assertIsInstance(commands.book.commands["!discord"], TextCommand)
             self.assertNotIn("!song", commands.book.commands)
 
+    def test_command_name_accepts_a_word_with_or_without_a_bang(self) -> None:
+        self.assertEqual(command_name("Discord"), "!discord")
+        self.assertEqual(command_name("  !Song  "), "!song")
+        with self.assertRaises(CommandFileError):
+            command_name("my command")
+        with self.assertRaises(CommandFileError):
+            command_name("!")
+
+    def test_add_and_remove_a_text_command_without_touching_built_ins(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "commands.json"
+            path.write_text(
+                json.dumps({"cooldown_seconds": 10, "!song": {"handler": "spotify_song"}}) + "\n",
+                encoding="utf-8",
+            )
+            commands = CommandFile(path)
+            self.assertEqual(commands.add_text_command("discord", " https://discord.gg/example "), "!discord")
+            self.assertEqual(commands.text_commands(), [("!discord", "https://discord.gg/example")])
+            self.assertEqual(commands.handler_names(), ["!song"])
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["cooldown_seconds"], 10)
+            self.assertEqual(saved["!song"], {"handler": "spotify_song"})
+            self.assertEqual(saved["!discord"], "https://discord.gg/example")
+
+            with self.assertRaises(CommandFileError):
+                commands.add_text_command("!song", "nope")
+            with self.assertRaises(CommandFileError):
+                commands.add_text_command("!discord", "again")
+            with self.assertRaises(CommandFileError):
+                commands.add_text_command("!empty", "   ")
+            with self.assertRaises(CommandFileError):
+                commands.remove_text_command("!song")
+
+            commands.remove_text_command("!discord")
+            self.assertEqual(commands.text_commands(), [])
+            self.assertIn("!song", commands.book.commands)
+            self.assertNotIn("!discord", json.loads(path.read_text(encoding="utf-8")))
+
     def test_missing_file_is_created(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "commands.json"
             commands = CommandFile(path)
             self.assertTrue(path.exists())
             self.assertIn("!playlist", commands.book.commands)
+            self.assertIn("!queue", commands.book.commands)
 
 
 if __name__ == "__main__":

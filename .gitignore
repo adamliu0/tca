@@ -2,8 +2,14 @@
 .env
 config.json
 config.json.tmp
+commands.json.tmp
 .tio.tokens.json
 .spotify_cache
+.song_requests.json
+.song_requests.json.tmp
+tca.log
+build/
+dist/
 __pycache__/
 *.pyc
 .pytest_cache/

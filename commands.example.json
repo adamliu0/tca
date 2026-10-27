@@ -6,5 +6,8 @@
   },
   "!playlist": {
     "handler": "spotify_playlist"
+  },
+  "!queue": {
+    "handler": "spotify_queue"
   }
 }

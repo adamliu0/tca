@@ -1,1 +1,1 @@
-"""Twitch Chat Autoreply."""
+"""Twitch Chat Assistant."""

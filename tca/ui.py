@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import ctypes
+import struct
 import sys
 import tkinter as tk
 import webbrowser
+import zlib
 from collections.abc import Callable
 from pathlib import Path
 from tkinter import ttk
 
 from tca.bot import REDIRECT_URL as TWITCH_REDIRECT
+from tca.commands import CommandFile, CommandFileError
+from tca.request_log import RequestBoard, RequestLogError
 from tca.spotify import REDIRECT_URI as SPOTIFY_REDIRECT
 from tca.status import AppStatus, StatusRow, status_rows
 
@@ -18,7 +22,6 @@ from tca.status import AppStatus, StatusRow, status_rows
 _BG = "#0e0e10"
 _CARD = "#18181b"
 _FIELD = "#0e0e10"
-_RAISED = "#2f2f35"
 _TEXT = "#efeff1"
 _MUTED = "#adadb8"
 _LINE = "#3a3a3d"
@@ -26,6 +29,9 @@ _PURPLE = "#9146ff"
 _PURPLE_HOVER = "#772ce8"
 _PURPLE_PRESSED = "#5c16c5"
 _PURPLE_DISABLED = "#3d2866"
+_NOTE_HOLD_MS = 3000
+_NOTE_FADE_MS = 1000
+_NOTE_FADE_STEPS = 10
 _TONES = {
     "ok": "#00f593",
     "wait": "#ffca5f",
@@ -36,6 +42,121 @@ _TONES = {
 _Save = Callable[[str, str], None]
 
 
+def _assets() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS")) / "assets"
+    return Path(__file__).resolve().parent.parent / "assets"
+
+
+_LOGO = _assets() / "tca.png"
+_LOGO_SIZE = 48
+
+
+def _paeth(left: int, up: int, up_left: int) -> int:
+    estimate = left + up - up_left
+    distance_left = abs(estimate - left)
+    distance_up = abs(estimate - up)
+    distance_up_left = abs(estimate - up_left)
+    if distance_left <= distance_up and distance_left <= distance_up_left:
+        return left
+    if distance_up <= distance_up_left:
+        return up
+    return up_left
+
+
+def _rgba_png(path: Path) -> tuple[int, int, list[bytes]] | None:
+    """Decode an 8-bit RGBA PNG. Returns None for any other file."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    pos = 8
+    width = height = bit = color = 0
+    chunks: list[bytes] = []
+    while pos + 8 <= len(data):
+        length = struct.unpack(">I", data[pos : pos + 4])[0]
+        kind = data[pos + 4 : pos + 8]
+        start = pos + 8
+        chunk = data[start : start + length]
+        pos = start + length + 4
+        if kind == b"IHDR":
+            width, height, bit, color, _compression, png_filter, interlace = struct.unpack(">IIBBBBB", chunk[:13])
+            if png_filter != 0 or interlace != 0:
+                return None
+        elif kind == b"IDAT":
+            chunks.append(chunk)
+        elif kind == b"IEND":
+            break
+    if bit != 8 or color != 6 or width < 1 or height < 1:
+        return None
+    raw = zlib.decompress(b"".join(chunks))
+    stride = width * 4
+    rows: list[bytes] = []
+    previous = bytearray(stride)
+    index = 0
+    for _y in range(height):
+        filter_type = raw[index]
+        index += 1
+        scanline = bytearray(raw[index : index + stride])
+        index += stride
+        row = bytearray(stride)
+        for x in range(stride):
+            left = row[x - 4] if x >= 4 else 0
+            up = previous[x]
+            up_left = previous[x - 4] if x >= 4 else 0
+            value = scanline[x]
+            if filter_type == 1:
+                value = (value + left) & 255
+            elif filter_type == 2:
+                value = (value + up) & 255
+            elif filter_type == 3:
+                value = (value + ((left + up) // 2)) & 255
+            elif filter_type == 4:
+                value = (value + _paeth(left, up, up_left)) & 255
+            elif filter_type != 0:
+                return None
+            row[x] = value
+        rows.append(bytes(row))
+        previous = row
+    return width, height, rows
+
+
+def _header_logo(path: Path, size: int) -> tk.PhotoImage | None:
+    """Shrink the app logo so the header can show it beside the title."""
+    decoded = _rgba_png(path)
+    if decoded is None:
+        return None
+    width, height, rows = decoded
+    image = tk.PhotoImage(width=size, height=size)
+    lines: list[str] = []
+    for y in range(size):
+        y0 = y * height // size
+        y1 = max(y0 + 1, (y + 1) * height // size)
+        cells: list[str] = []
+        for x in range(size):
+            x0 = x * width // size
+            x1 = max(x0 + 1, (x + 1) * width // size)
+            red = green = blue = weight = 0
+            for py in range(y0, y1):
+                row = rows[py]
+                for px in range(x0, x1):
+                    offset = px * 4
+                    alpha = row[offset + 3]
+                    red += row[offset] * alpha
+                    green += row[offset + 1] * alpha
+                    blue += row[offset + 2] * alpha
+                    weight += alpha
+            if weight < 128:
+                cells.append("{}")
+            else:
+                cells.append(f"#{red // weight:02x}{green // weight:02x}{blue // weight:02x}")
+        lines.append(" ".join(cells))
+    image.put(lines)
+    return image
+
+
 class StatusWindow:
     def __init__(
         self,
@@ -44,11 +165,13 @@ class StatusWindow:
         on_link_spotify: Callable[[], None],
         on_save_twitch: _Save | None = None,
         on_save_spotify: _Save | None = None,
+        commands: CommandFile | None = None,
+        requests: RequestBoard | None = None,
     ) -> None:
         self._status = status
         self._actions = {"Twitch": on_link_twitch, "Spotify": on_link_spotify}
         if sys.platform == "win32":
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("TCA.TwitchChatAutoreply")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("TCA.TwitchChatAssistant")
         self.root = tk.Tk()
         self.root.title("TCA")
         self.root.configure(bg=_BG)
@@ -62,15 +185,25 @@ class StatusWindow:
 
         header = tk.Frame(shell, bg=_BG)
         header.pack(fill="x")
-        mark = tk.Frame(header, bg=_PURPLE, width=14, height=14, highlightthickness=0)
-        mark.pack(side="left", padx=(0, 8), pady=(6, 0))
-        mark.pack_propagate(False)
+        self._mark_image = _header_logo(_LOGO, _LOGO_SIZE)
+        if self._mark_image is not None:
+            tk.Label(
+                header,
+                image=self._mark_image,
+                bg=_BG,
+                bd=0,
+                highlightthickness=0,
+            ).pack(side="left", padx=(0, 10))
+        else:
+            mark = tk.Frame(header, bg=_PURPLE, width=14, height=14, highlightthickness=0)
+            mark.pack(side="left", padx=(0, 8), pady=(6, 0))
+            mark.pack_propagate(False)
         titles = tk.Frame(header, bg=_BG)
         titles.pack(side="left", fill="x", expand=True)
         tk.Label(titles, text="TCA", bg=_BG, fg=_TEXT, font=("Segoe UI", 18, "bold"), anchor="w").pack(fill="x")
         tk.Label(
             titles,
-            text="Twitch Chat Autoreply",
+            text="Twitch Chat Assistant",
             bg=_BG,
             fg=_MUTED,
             font=("Segoe UI", 10),
@@ -84,7 +217,7 @@ class StatusWindow:
 
         self._footer = tk.Label(
             shell,
-            text="Leave this window in the background. It does not use your keyboard or mouse.",
+            text="Leave this window running in the background to maintain TCA Bot functions and commands.",
             bg=_BG,
             fg=_MUTED,
             font=("Segoe UI", 9),
@@ -123,8 +256,19 @@ class StatusWindow:
             on_save=on_save_spotify or _noop_save,
             on_saved=self._sync,
         )
-        self._twitch_form.anchor(self._footer)
-        self._spotify_form.anchor(self._footer)
+        self._requests = _RequestPanel(shell, requests, on_changed=self._sync) if requests is not None else None
+        self._commands = _CommandPanel(shell, commands, on_changed=self._sync) if commands is not None else None
+        anchor = self._footer
+        if self._requests is not None:
+            anchor = self._requests.frame
+        elif self._commands is not None:
+            anchor = self._commands.frame
+        self._twitch_form.anchor(anchor)
+        self._spotify_form.anchor(anchor)
+        if self._requests is not None:
+            self._requests.frame.pack(fill="x", pady=(8, 0))
+        if self._commands is not None:
+            self._commands.frame.pack(fill="x", pady=(8, 0))
         self._footer.pack(fill="x", pady=(14, 0))
 
         self._placed = False
@@ -144,14 +288,14 @@ class StatusWindow:
     def run(self) -> None:
         self._sync()
         self._dark_title_bar()
-        icon_ico = Path(__file__).resolve().parent.parent / "assets" / "tca.ico"
+        icon_ico = _assets() / "tca.ico"
         if icon_ico.exists():
             self._set_windows_icon(icon_ico)
         self.root.after(400, self._refresh)
         self.root.mainloop()
 
     def _apply_icon(self) -> None:
-        icon_png = Path(__file__).resolve().parent.parent / "assets" / "tca.png"
+        icon_png = _assets() / "tca.png"
         if not icon_png.exists():
             return
         self._icon_image = tk.PhotoImage(file=str(icon_png))
@@ -192,23 +336,37 @@ class StatusWindow:
     def _styles(self) -> None:
         style = ttk.Style(self.root)
         style.theme_use("clam")
-        style.configure("Link.TButton", padding=(10, 2), background=_PURPLE, foreground="#ffffff", borderwidth=0, focusthickness=0, font=("Segoe UI", 9))
+        self._purple_button(style, "Link.TButton", padding=(10, 2))
+        self._purple_button(style, "Primary.TButton", padding=(12, 6))
+        self._purple_button(style, "Ghost.TButton", padding=(10, 4))
+
+    def _purple_button(self, style: ttk.Style, name: str, *, padding: tuple[int, int]) -> None:
+        """Flat Twitch purple, the same color as the logo and the header line.
+
+        The clam theme lightens a button unless the border shades match the face.
+        """
+        style.configure(
+            name,
+            padding=padding,
+            background=_PURPLE,
+            foreground="#ffffff",
+            borderwidth=0,
+            relief="flat",
+            focusthickness=0,
+            focuscolor=_PURPLE,
+            bordercolor=_PURPLE,
+            lightcolor=_PURPLE,
+            darkcolor=_PURPLE,
+            font=("Segoe UI", 9),
+        )
         style.map(
-            "Link.TButton",
+            name,
             background=[("pressed", _PURPLE_PRESSED), ("active", _PURPLE_HOVER), ("disabled", _PURPLE_DISABLED)],
             foreground=[("disabled", _MUTED)],
-        )
-        style.configure("Primary.TButton", padding=(12, 6), background=_PURPLE, foreground="#ffffff", borderwidth=0, focusthickness=0, font=("Segoe UI", 9))
-        style.map(
-            "Primary.TButton",
-            background=[("pressed", _PURPLE_PRESSED), ("active", _PURPLE_HOVER), ("disabled", _PURPLE_DISABLED)],
-            foreground=[("disabled", _MUTED)],
-        )
-        style.configure("Ghost.TButton", padding=(10, 4), background=_RAISED, foreground=_TEXT, borderwidth=0, focusthickness=0, font=("Segoe UI", 9))
-        style.map(
-            "Ghost.TButton",
-            background=[("pressed", "#26262c"), ("active", "#3a3a3d"), ("disabled", _CARD)],
-            foreground=[("disabled", _MUTED)],
+            bordercolor=[("pressed", _PURPLE_PRESSED), ("active", _PURPLE_HOVER), ("disabled", _PURPLE_DISABLED)],
+            lightcolor=[("pressed", _PURPLE_PRESSED), ("active", _PURPLE_HOVER), ("disabled", _PURPLE_DISABLED)],
+            darkcolor=[("pressed", _PURPLE_PRESSED), ("active", _PURPLE_HOVER), ("disabled", _PURPLE_DISABLED)],
+            focuscolor=[("pressed", _PURPLE_PRESSED), ("active", _PURPLE_HOVER), ("disabled", _PURPLE_DISABLED)],
         )
 
     def _build_row(self, parent: tk.Frame, name: str) -> dict[str, tk.Widget]:
@@ -259,6 +417,10 @@ class StatusWindow:
         self._apply(status_rows(snapshot))
         self._twitch_form.set_visible(snapshot.twitch_state == "needs_setup")
         self._spotify_form.set_visible(snapshot.spotify_state == "needs_setup")
+        if self._requests is not None:
+            self._requests.sync()
+        if self._commands is not None:
+            self._commands.sync()
         self._fit()
 
     def _fit(self) -> None:
@@ -458,6 +620,313 @@ class _CredentialForm:
                 self._note.pack(fill="x", pady=(6, 0))
         elif self._note.winfo_ismapped():
             self._note.pack_forget()
+
+
+class _RequestPanel:
+    """Song requests still waiting, each with a way to drop it from the list."""
+
+    def __init__(self, parent: tk.Frame, requests: RequestBoard, on_changed: Callable[[], None]) -> None:
+        self._requests = requests
+        self._on_changed = on_changed
+        self._shown: tuple[tuple[int, str, str, str, str], ...] | None = None
+        self._note_color = _TONES["ok"]
+        self._fade_after: str | None = None
+        self.frame = tk.Frame(
+            parent,
+            bg=_CARD,
+            highlightbackground=_LINE,
+            highlightthickness=1,
+            padx=12,
+            pady=10,
+        )
+        tk.Label(self.frame, text="Song requests", bg=_CARD, fg=_TEXT, font=("Segoe UI", 11, "bold"), anchor="w").pack(
+            fill="x"
+        )
+        tk.Label(
+            self.frame,
+            text="Viewers' songs still waiting. Remove drops one from this list and from !queue.",
+            bg=_CARD,
+            fg=_MUTED,
+            font=("Segoe UI", 9),
+            anchor="w",
+            justify="left",
+            wraplength=470,
+        ).pack(fill="x", pady=(4, 8))
+        self._list = tk.Frame(self.frame, bg=_CARD)
+        self._list.pack(fill="x")
+        self._note = tk.Label(
+            self.frame,
+            text="",
+            bg=_CARD,
+            fg=_TONES["bad"],
+            font=("Segoe UI", 9),
+            anchor="w",
+            justify="left",
+            wraplength=470,
+        )
+
+    def sync(self) -> None:
+        shown = self._requests.snapshot()
+        if shown == self._shown:
+            return
+        self._shown = shown
+        for child in self._list.winfo_children():
+            child.destroy()
+        if not shown:
+            tk.Label(
+                self._list,
+                text="No song requests are waiting.",
+                bg=_CARD,
+                fg=_MUTED,
+                font=("Segoe UI", 9),
+                anchor="w",
+            ).pack(fill="x")
+            return
+        for index, _track_id, title, artist, viewer in shown:
+            row = tk.Frame(self._list, bg=_CARD)
+            row.pack(fill="x", pady=(0, 4))
+            tk.Label(
+                row,
+                text=_short_reply(f"{title} - {artist}"),
+                bg=_CARD,
+                fg=_TEXT,
+                font=("Segoe UI", 9, "bold"),
+                anchor="w",
+            ).pack(side="left")
+            tk.Label(
+                row,
+                text=viewer,
+                bg=_CARD,
+                fg=_MUTED,
+                font=("Segoe UI", 9),
+                anchor="w",
+            ).pack(side="left", fill="x", expand=True, padx=(8, 8))
+            ttk.Button(
+                row,
+                text="Remove",
+                style="Link.TButton",
+                command=lambda item=index: self._remove(item),
+            ).pack(side="right")
+
+    def _remove(self, index: int) -> None:
+        try:
+            removed = self._requests.remove(index)
+        except RequestLogError as exc:
+            self._set_note(str(exc))
+            return
+        self._set_note(f"Removed {removed.title}. Spotify may still play it.", ok=True)
+        self._on_changed()
+
+    def _set_note(self, text: str, *, ok: bool = False) -> None:
+        self._cancel_fade()
+        if not text:
+            if self._note.winfo_ismapped():
+                self._note.pack_forget()
+            return
+        self._note_color = _TONES["ok"] if ok else _TONES["bad"]
+        self._note.configure(text=text, fg=self._note_color)
+        if not self._note.winfo_ismapped():
+            self._note.pack(fill="x", pady=(6, 0))
+        self._fade_after = self._note.after(_NOTE_HOLD_MS, self._fade_step)
+
+    def _fade_step(self, step: int = 1) -> None:
+        self._fade_after = None
+        try:
+            if not self._note.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        if step > _NOTE_FADE_STEPS:
+            if self._note.winfo_ismapped():
+                self._note.pack_forget()
+            self._on_changed()
+            return
+        self._note.configure(fg=_blend(self._note_color, _CARD, step / _NOTE_FADE_STEPS))
+        self._fade_after = self._note.after(
+            _NOTE_FADE_MS // _NOTE_FADE_STEPS,
+            lambda next_step=step + 1: self._fade_step(next_step),
+        )
+
+    def _cancel_fade(self) -> None:
+        after_id = self._fade_after
+        self._fade_after = None
+        if after_id is None:
+            return
+        try:
+            self._note.after_cancel(after_id)
+        except tk.TclError:
+            return
+
+
+def _blend(start: str, end: str, amount: float) -> str:
+    def channel(first: str, second: str) -> int:
+        return round(int(first, 16) + (int(second, 16) - int(first, 16)) * amount)
+
+    return f"#{channel(start[1:3], end[1:3]):02x}{channel(start[3:5], end[3:5]):02x}{channel(start[5:7], end[5:7]):02x}"
+
+
+class _CommandPanel:
+    """Add and remove text commands. Built-in Spotify commands stay."""
+
+    def __init__(self, parent: tk.Frame, commands: CommandFile, on_changed: Callable[[], None]) -> None:
+        self._commands = commands
+        self._on_changed = on_changed
+        self._shown: tuple[tuple[str, str], ...] | None = None
+        self._handlers: tuple[str, ...] | None = None
+        self.frame = tk.Frame(
+            parent,
+            bg=_CARD,
+            highlightbackground=_LINE,
+            highlightthickness=1,
+            padx=12,
+            pady=10,
+        )
+        tk.Label(self.frame, text="Commands", bg=_CARD, fg=_TEXT, font=("Segoe UI", 11, "bold"), anchor="w").pack(
+            fill="x"
+        )
+        tk.Label(
+            self.frame,
+            text="Add a name such as !discord and the reply chat should see.",
+            bg=_CARD,
+            fg=_MUTED,
+            font=("Segoe UI", 9),
+            anchor="w",
+            justify="left",
+            wraplength=470,
+        ).pack(fill="x", pady=(4, 8))
+        self._built_in = tk.Label(
+            self.frame,
+            text="",
+            bg=_CARD,
+            fg=_MUTED,
+            font=("Segoe UI", 9),
+            anchor="w",
+            justify="left",
+            wraplength=470,
+        )
+        self._built_in.pack(fill="x", pady=(0, 6))
+        self._list = tk.Frame(self.frame, bg=_CARD)
+        self._list.pack(fill="x")
+        self._name = self._field("Name")
+        self._reply = self._field("Reply")
+        self._name.bind("<Return>", self._add_event)
+        self._reply.bind("<Return>", self._add_event)
+        ttk.Button(self.frame, text="Add command", style="Primary.TButton", command=self._add).pack(
+            anchor="w", pady=(8, 0)
+        )
+        self._note = tk.Label(
+            self.frame,
+            text="",
+            bg=_CARD,
+            fg=_TONES["bad"],
+            font=("Segoe UI", 9),
+            anchor="w",
+            justify="left",
+            wraplength=470,
+        )
+
+    def sync(self) -> None:
+        text = tuple(self._commands.text_commands())
+        handlers = tuple(self._commands.handler_names())
+        if text == self._shown and handlers == self._handlers:
+            return
+        self._shown = text
+        self._handlers = handlers
+        built_in = ", ".join(handlers) if handlers else "none"
+        self._built_in.configure(text=f"Built in: {built_in}")
+        for child in self._list.winfo_children():
+            child.destroy()
+        if not text:
+            tk.Label(
+                self._list,
+                text="No extra commands yet.",
+                bg=_CARD,
+                fg=_MUTED,
+                font=("Segoe UI", 9),
+                anchor="w",
+            ).pack(fill="x", pady=(0, 6))
+            return
+        for name, reply in text:
+            row = tk.Frame(self._list, bg=_CARD)
+            row.pack(fill="x", pady=(0, 4))
+            tk.Label(
+                row,
+                text=name,
+                bg=_CARD,
+                fg=_TEXT,
+                font=("Segoe UI", 9, "bold"),
+                anchor="w",
+            ).pack(side="left")
+            tk.Label(
+                row,
+                text=_short_reply(reply),
+                bg=_CARD,
+                fg=_MUTED,
+                font=("Segoe UI", 9),
+                anchor="w",
+            ).pack(side="left", fill="x", expand=True, padx=(8, 8))
+            ttk.Button(
+                row,
+                text="Remove",
+                style="Link.TButton",
+                command=lambda command=name: self._remove(command),
+            ).pack(side="right")
+
+    def _field(self, label: str) -> tk.Entry:
+        row = tk.Frame(self.frame, bg=_CARD)
+        row.pack(fill="x", pady=(4, 0))
+        tk.Label(row, text=label, bg=_CARD, fg=_TEXT, font=("Segoe UI", 9), width=14, anchor="w").pack(side="left")
+        entry = tk.Entry(
+            row,
+            font=("Segoe UI", 10),
+            bg=_FIELD,
+            fg=_TEXT,
+            insertbackground=_TEXT,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=_LINE,
+            highlightcolor=_PURPLE,
+        )
+        entry.pack(side="left", fill="x", expand=True, ipady=3)
+        return entry
+
+    def _add_event(self, _event: tk.Event[tk.Misc]) -> str:
+        self._add()
+        return "break"
+
+    def _add(self) -> None:
+        try:
+            name = self._commands.add_text_command(self._name.get(), self._reply.get())
+        except CommandFileError as exc:
+            self._set_note(str(exc))
+            return
+        self._name.delete(0, "end")
+        self._reply.delete(0, "end")
+        self._set_note(f"Added {name}.", ok=True)
+        self._on_changed()
+
+    def _remove(self, name: str) -> None:
+        try:
+            self._commands.remove_text_command(name)
+        except CommandFileError as exc:
+            self._set_note(str(exc))
+            return
+        self._set_note(f"Removed {name}.", ok=True)
+        self._on_changed()
+
+    def _set_note(self, text: str, *, ok: bool = False) -> None:
+        if text:
+            self._note.configure(text=text, fg=_TONES["ok"] if ok else _TONES["bad"])
+            if not self._note.winfo_ismapped():
+                self._note.pack(fill="x", pady=(6, 0))
+        elif self._note.winfo_ismapped():
+            self._note.pack_forget()
+
+
+def _short_reply(text: str, limit: int = 42) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
 
 
 def _noop_save(_client_id: str, _secret: str) -> None:
