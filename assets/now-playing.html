@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Now playing</title>
+<style>
+  :root {
+    --card: #241433;
+    --text: #f4f4f5;
+    --muted: rgba(244, 244, 245, 0.72);
+    --accent: #9146ff;
+    --track: rgba(255, 255, 255, 0.16);
+  }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: transparent;
+    color: var(--text);
+    font-family: "Segoe UI", sans-serif;
+  }
+  body.preview { background: #18181b; }
+  .stage {
+    box-sizing: border-box;
+    min-height: 100%;
+    display: flex;
+    align-items: center;
+    padding: 12px;
+  }
+  .card {
+    box-sizing: border-box;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 16px;
+    border-radius: 28px;
+    background: var(--card);
+    box-shadow: 0 12px 28px rgba(0, 0, 0, 0.28);
+  }
+  #player {
+    position: relative;
+    overflow: hidden;
+    isolation: isolate;
+    background: #120b1a;
+  }
+  #player::before {
+    content: "";
+    position: absolute;
+    inset: -45%;
+    z-index: 0;
+    background:
+      radial-gradient(ellipse at 16% 18%, var(--wash-a, #4a2a6e) 0%, transparent 58%),
+      radial-gradient(ellipse at 92% 8%, var(--wash-b, #2a1844) 0%, transparent 52%),
+      radial-gradient(ellipse at 68% 110%, var(--wash-c, #1a1028) 0%, transparent 62%);
+    filter: blur(28px) saturate(1.25);
+  }
+  #player::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    background: linear-gradient(155deg, rgba(10, 8, 14, 0.18), rgba(10, 8, 14, 0.62));
+  }
+  .main, .progress { position: relative; z-index: 1; }
+  .main { display: flex; gap: 14px; min-width: 0; align-items: center; }
+  .art-wrap {
+    width: 92px;
+    height: 92px;
+    border-radius: 16px;
+    overflow: hidden;
+    flex: none;
+    background: rgba(255, 255, 255, 0.08);
+  }
+  .art-wrap img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .meta { min-width: 0; display: flex; flex-direction: column; justify-content: center; }
+  .title {
+    font-size: 22px;
+    font-weight: 600;
+    line-height: 1.2;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .artist, .by {
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .artist { margin-top: 4px; font-size: 15px; }
+  .by { margin-top: 4px; font-size: 13px; }
+  .bar {
+    height: 6px;
+    border-radius: 999px;
+    background: var(--track);
+    overflow: hidden;
+  }
+  .bar > span {
+    display: block;
+    height: 100%;
+    width: 0;
+    border-radius: inherit;
+    background: var(--accent);
+  }
+  .times {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 6px;
+    font-size: 12px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .empty {
+    align-items: center;
+    color: var(--muted);
+    font-size: 15px;
+  }
+  #empty { display: none; }
+  body.preview #empty { display: flex; }
+  #player[hidden], #empty[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div class="stage">
+  <article id="player" class="card" hidden>
+    <div class="main">
+      <div class="art-wrap"><img id="art" alt=""></div>
+      <div class="meta">
+        <div id="title" class="title"></div>
+        <div id="artist" class="artist"></div>
+        <div id="by" class="by" hidden></div>
+      </div>
+    </div>
+    <div class="progress">
+      <div class="bar"><span id="fill"></span></div>
+      <div class="times"><span id="elapsed">0:00</span><span id="total">0:00</span></div>
+    </div>
+  </article>
+  <article id="empty" class="card empty">Nothing is playing</article>
+</div>
+<script>
+const preview = new URLSearchParams(location.search).has("preview");
+if (preview) document.body.classList.add("preview");
+
+const player = document.querySelector("#player");
+const empty = document.querySelector("#empty");
+const art = document.querySelector("#art");
+const title = document.querySelector("#title");
+const artist = document.querySelector("#artist");
+const by = document.querySelector("#by");
+const fill = document.querySelector("#fill");
+const elapsed = document.querySelector("#elapsed");
+const total = document.querySelector("#total");
+
+let trackId = "";
+let progress = 0;
+let duration = 0;
+let playing = false;
+let receivedAt = 0;
+
+art.addEventListener("load", () => {
+  const theme = colorsFrom(art);
+  if (!theme) return;
+  player.style.setProperty("--wash-a", theme.wash[0]);
+  player.style.setProperty("--wash-b", theme.wash[1]);
+  player.style.setProperty("--wash-c", theme.wash[2]);
+  fill.style.background = theme.accent;
+});
+
+function colorsFrom(image) {
+  const size = 36;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  context.drawImage(image, 0, 0, size, size);
+  let pixels;
+  try {
+    pixels = context.getImageData(0, 0, size, size).data;
+  } catch (error) {
+    return null;
+  }
+  const regions = [
+    sampleRegion(pixels, size, 0, 0, 0.5, 0.55),
+    sampleRegion(pixels, size, 0.5, 0, 1, 0.55),
+    sampleRegion(pixels, size, 0.12, 0.42, 0.88, 1),
+  ].filter(Boolean);
+  if (regions.length === 0) return null;
+  while (regions.length < 3) regions.push(regions[regions.length - 1]);
+  const accent = regions.slice().sort((left, right) => right.saturation - left.saturation)[0];
+  return {
+    wash: regions.map((region) => washColor(region)),
+    accent: lift([accent.red, accent.green, accent.blue]),
+  };
+}
+
+function sampleRegion(pixels, size, x0, y0, x1, y1) {
+  let red = 0;
+  let green = 0;
+  let blue = 0;
+  let weight = 0;
+  const left = Math.floor(x0 * size);
+  const top = Math.floor(y0 * size);
+  const right = Math.ceil(x1 * size);
+  const bottom = Math.ceil(y1 * size);
+  for (let y = top; y < bottom; y += 1) {
+    for (let x = left; x < right; x += 1) {
+      const index = (y * size + x) * 4;
+      const r = pixels[index];
+      const g = pixels[index + 1];
+      const b = pixels[index + 2];
+      const alpha = pixels[index + 3];
+      if (alpha < 200) continue;
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      if (max < 18) continue;
+      const sampleWeight = (max - min) + 12;
+      red += r * sampleWeight;
+      green += g * sampleWeight;
+      blue += b * sampleWeight;
+      weight += sampleWeight;
+    }
+  }
+  if (weight === 0) return null;
+  const r = red / weight;
+  const g = green / weight;
+  const b = blue / weight;
+  const max = Math.max(r, g, b);
+  return {
+    red: r,
+    green: g,
+    blue: b,
+    saturation: max === 0 ? 0 : (max - Math.min(r, g, b)) / max,
+  };
+}
+
+function washColor(region) {
+  return "rgb(" + [region.red, region.green, region.blue].map((part) => {
+    return Math.round(Math.min(255, part * 0.82 + 22));
+  }).join(",") + ")";
+}
+
+function lift(parts) {
+  return "rgb(" + parts.map((part) => Math.min(255, Math.round(part * 0.65 + 90))).join(",") + ")";
+}
+
+function clock(ms) {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(seconds / 60);
+  return minutes + ":" + String(seconds % 60).padStart(2, "0");
+}
+
+const SNAP_MS = 1200;
+
+function shownPosition() {
+  const elapsedMs = playing ? performance.now() - receivedAt : 0;
+  return Math.min(duration, progress + elapsedMs);
+}
+
+function correctedPosition(data) {
+  const base = Number(data.progress_ms) || 0;
+  const polledAt = Number(data.polled_at_ms) || 0;
+  if (!data.is_playing || polledAt <= 0) {
+    return base;
+  }
+  const age = Date.now() - polledAt;
+  if (age < 0 || age > 15000) {
+    return base;
+  }
+  return base + age;
+}
+
+function paint() {
+  const position = shownPosition();
+  const ratio = duration > 0 ? position / duration : 0;
+  fill.style.width = Math.max(0, Math.min(1, ratio)) * 100 + "%";
+  elapsed.textContent = clock(position);
+  total.textContent = clock(duration);
+  requestAnimationFrame(paint);
+}
+
+function showNothing() {
+  player.hidden = true;
+  empty.hidden = false;
+  playing = false;
+}
+
+function apply(data) {
+  if (!data || !data.title) {
+    showNothing();
+    return;
+  }
+  empty.hidden = true;
+  player.hidden = false;
+  title.textContent = data.title;
+  artist.textContent = data.artist || "";
+  if (data.requester) {
+    by.hidden = false;
+    by.textContent = "Requested by " + data.requester;
+  } else {
+    by.hidden = true;
+    by.textContent = "";
+  }
+  const nextDuration = Number(data.duration_ms) || 0;
+  const nextPlaying = Boolean(data.is_playing);
+  const corrected = nextDuration > 0 ? Math.min(nextDuration, correctedPosition(data)) : correctedPosition(data);
+  const trackChanged = (data.track_id || "") !== trackId;
+  // A poll that is a fraction of a second off used to yank the bar back and forth.
+  // Keep the clock that is already running unless this sample clearly disagrees.
+  if (trackChanged || nextPlaying !== playing || Math.abs(corrected - shownPosition()) > SNAP_MS) {
+    progress = corrected;
+    receivedAt = performance.now();
+    playing = nextPlaying;
+  }
+  duration = nextDuration;
+  if (data.track_id !== trackId) {
+    trackId = data.track_id || "";
+    player.style.removeProperty("--wash-a");
+    player.style.removeProperty("--wash-b");
+    player.style.removeProperty("--wash-c");
+    fill.style.background = "";
+    if (data.artwork_url) {
+      art.hidden = false;
+      art.src = "/artwork?track=" + encodeURIComponent(trackId);
+    } else {
+      art.hidden = true;
+      art.removeAttribute("src");
+    }
+  }
+}
+
+async function refresh() {
+  try {
+    const response = await fetch("/now-playing.json", { cache: "no-store" });
+    apply(await response.json());
+  } catch (error) {
+    return;
+  }
+}
+
+refresh();
+setInterval(refresh, 2000);
+requestAnimationFrame(paint);
+</script>
+</body>
+</html>

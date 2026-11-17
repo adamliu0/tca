@@ -55,6 +55,13 @@ class ReplyTests(unittest.TestCase):
     def test_playlist_without_a_name(self) -> None:
         self.assertEqual(format_playlist(TRACK, None), "Playlist: https://open.spotify.com/playlist/pl123")
 
+    def test_paused_playlist_is_not_current(self) -> None:
+        paused = {**TRACK, "is_playing": False}
+        self.assertEqual(format_playlist(paused, "Late Night"), "Currently not listening to a playlist")
+
+    def test_nothing_playing_has_no_playlist(self) -> None:
+        self.assertEqual(format_playlist(None, "Late Night"), "Currently not listening to a playlist")
+
     def test_album_is_not_called_a_playlist(self) -> None:
         album = {
             "is_playing": True,
@@ -64,14 +71,12 @@ class ReplyTests(unittest.TestCase):
                 "external_urls": {"spotify": "https://open.spotify.com/album/al1"},
             },
         }
-        reply = format_playlist(album, None)
-        self.assertIn("album", reply)
-        self.assertIn("https://open.spotify.com/album/al1", reply)
+        self.assertEqual(format_playlist(album, None), "Currently not listening to a playlist")
         self.assertIsNone(playlist_id(album))
 
     def test_liked_songs(self) -> None:
         liked = {"is_playing": True, "item": {"name": "Track"}, "context": {"type": "collection"}}
-        self.assertIn("Liked Songs", format_playlist(liked, None))
+        self.assertEqual(format_playlist(liked, None), "Currently not listening to a playlist")
 
     def test_clamp_keeps_twitch_limit(self) -> None:
         long = "word " * 200

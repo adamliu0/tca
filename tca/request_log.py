@@ -38,6 +38,7 @@ class RequestLog:
         self.path = path
         self._lock = threading.Lock()
         self._items, self._cancellations = self._load()
+        self._seen_waiting: set[int] = set()
 
     def add(self, request: SongRequest) -> None:
         stored = SongRequest(
@@ -48,8 +49,10 @@ class RequestLog:
         )
         with self._lock:
             self._items.append(stored)
-            if len(self._items) > _STORE_LIMIT:
-                self._items = self._items[-_STORE_LIMIT:]
+            overflow = len(self._items) - _STORE_LIMIT
+            if overflow > 0:
+                self._items = self._items[overflow:]
+                self._seen_waiting = {index - overflow for index in self._seen_waiting if index >= overflow}
             self._save()
 
     def upcoming(self, track_ids: list[str], limit: int = QUEUE_DISPLAY_LIMIT) -> list[SongRequest]:
@@ -71,7 +74,9 @@ class RequestLog:
                 self._cancellations = updated
                 self._save()
             visible = _without_cancellations(track_ids, self._cancellations)
-            return _match_indexed(self._items, visible, limit=None)
+            matched = _match_indexed(self._items, visible, limit=None)
+            self._seen_waiting.update(index for index, _item in matched)
+            return matched
 
     def remove_matched(self, track_ids: list[str], index: int) -> SongRequest:
         """Drop one waiting request so it leaves the list and !queue.
@@ -84,11 +89,30 @@ class RequestLog:
             if not any(item_index == index for item_index, _item in _match_indexed(self._items, visible, limit=None)):
                 raise RequestLogError("That song request is no longer waiting.")
             removed = self._items.pop(index)
+            self._seen_waiting = {
+                item - 1 if item > index else item for item in self._seen_waiting if item != index
+            }
             self._cancellations.append(removed.track_id)
             self._cancellations = _active_cancellations(self._cancellations, track_ids)
             self._save()
         logger.info("Removed song request %s - %s (%s).", removed.title, removed.artist, removed.viewer)
         return removed
+
+    def remember_waiting(self, track_ids: list[str]) -> None:
+        """Remember requests seen in the queue during this run of TCA."""
+        with self._lock:
+            visible = _without_cancellations(track_ids, self._cancellations)
+            matched = _match_indexed(self._items, visible, limit=None)
+            self._seen_waiting.update(index for index, _item in matched)
+
+    def current_viewer(self, track_id: str | None, queue_ids: list[str]) -> str | None:
+        """Viewer who requested the song playing now, when that request is the one playing."""
+        with self._lock:
+            visible = _without_cancellations(queue_ids, self._cancellations)
+            found = requester_for_current(self._items, track_id, visible, self._seen_waiting)
+        if found is None:
+            return None
+        return found.viewer
 
     def _load(self) -> tuple[list[SongRequest], list[str]]:
         if not self.path.exists():
@@ -149,13 +173,19 @@ class RequestLog:
 class RequestBoard:
     """The waiting requests for the status window, refreshed from Spotify's queue."""
 
-    def __init__(self, log: RequestLog, queue_ids: Callable[[], list[str] | None], interval: float = 3.0) -> None:
+    def __init__(
+        self,
+        log: RequestLog,
+        queue_ids: Callable[[], tuple[list[str], dict[str, str]] | None],
+        interval: float = 3.0,
+    ) -> None:
         self._log = log
         self._read_queue = queue_ids
         self._interval = interval
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._current_ids: list[str] = []
+        self._images: dict[str, str] = {}
         self._shown: list[tuple[int, SongRequest]] = []
         self._thread = threading.Thread(target=self._loop, name="tca-requests", daemon=True)
         self._thread.start()
@@ -163,38 +193,86 @@ class RequestBoard:
     def stop(self) -> None:
         self._stop.set()
 
-    def snapshot(self) -> tuple[tuple[int, str, str, str, str], ...]:
+    def snapshot(self) -> tuple[tuple[int, str, str, str, str, str], ...]:
         with self._lock:
             return tuple(
-                (index, item.track_id, item.title, item.artist, item.viewer) for index, item in self._shown
+                (
+                    index,
+                    item.track_id,
+                    item.title,
+                    item.artist,
+                    item.viewer,
+                    self._images.get(item.track_id, ""),
+                )
+                for index, item in self._shown
             )
 
     def remove(self, index: int) -> SongRequest:
         with self._lock:
             track_ids = list(self._current_ids)
+            images = dict(self._images)
         removed = self._log.remove_matched(track_ids, index)
-        self._set_shown(track_ids, self._log.matched(track_ids))
+        self._set_shown(track_ids, self._log.matched(track_ids), images)
         return removed
 
     def refresh(self) -> None:
         try:
-            track_ids = self._read_queue()
+            loaded = self._read_queue()
         except Exception:
             logger.exception("Could not refresh the song request list.")
             return
-        if track_ids is None:
+        if loaded is None:
             return
-        self._set_shown(track_ids, self._log.note_queue(track_ids))
+        track_ids, images = loaded
+        self._set_shown(track_ids, self._log.note_queue(track_ids), images)
 
-    def _set_shown(self, track_ids: list[str], shown: list[tuple[int, SongRequest]]) -> None:
+    def _set_shown(
+        self,
+        track_ids: list[str],
+        shown: list[tuple[int, SongRequest]],
+        images: dict[str, str],
+    ) -> None:
         with self._lock:
             self._current_ids = list(track_ids)
+            self._images = dict(images)
             self._shown = shown
 
     def _loop(self) -> None:
         while not self._stop.is_set():
             self.refresh()
             self._stop.wait(self._interval)
+
+
+def requester_for_current(
+    requests: list[SongRequest],
+    current_id: str | None,
+    queue_ids: list[str],
+    seen_waiting: set[int],
+) -> SongRequest | None:
+    """The request that just moved from the queue onto the current track.
+
+    Earlier requests are the ones that already left the queue. The latest of
+    those is credited only when another request is still queued behind it, or
+    this run of TCA saw that request waiting before the queue ran out.
+    """
+    if not current_id:
+        return None
+    matched = _match_indexed(requests, queue_ids, limit=None)
+    waiting = {index for index, _request in matched}
+    first_waiting = matched[0][0] if matched else None
+    passed = [
+        (index, request)
+        for index, request in enumerate(requests)
+        if index not in waiting and (first_waiting is None or index < first_waiting)
+    ]
+    if not passed:
+        return None
+    index, latest = passed[-1]
+    if latest.track_id != current_id:
+        return None
+    if first_waiting is not None or index in seen_waiting:
+        return latest
+    return None
 
 
 def match_upcoming(requests: list[SongRequest], track_ids: list[str], limit: int) -> list[SongRequest]:
@@ -267,7 +345,7 @@ def format_request_queue(requests: list[SongRequest]) -> str:
 
 def _queue_entry(index: int, request: SongRequest) -> str:
     viewer = request.viewer.strip()
-    return f"{index}. {request.title} - {request.artist} (requested by {viewer})"
+    return f"{index}. {request.title} - {request.artist} [requested by {viewer}]"
 
 
 def _plain(text: str) -> str:

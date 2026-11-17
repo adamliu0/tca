@@ -37,6 +37,7 @@ class Autoreply(twitchio.Client):
         client_secret: str,
         bot_id: str | None,
         requests: RequestLog,
+        report_oauth: Callable[[bool], None] | None = None,
     ) -> None:
         scopes = twitchio.Scopes(
             user_read_chat=True,
@@ -62,6 +63,7 @@ class Autoreply(twitchio.Client):
         self._redemptions = ReplyMemory(limit=200)
         self._spotify_lock = asyncio.Lock()
         self._requests = requests
+        self._report_oauth = report_oauth
         self._handlers: dict[str, Callable[[], str]] = {
             "spotify_song": self._song_reply,
             "spotify_playlist": self._playlist_reply,
@@ -95,11 +97,34 @@ class Autoreply(twitchio.Client):
         logger.info("TCA is running. Leave the status window in the background.")
         logger.info("Replies go out through Twitch's API and do not use your keyboard or mouse.")
         self._remember_login()
-        if self._listening or self._listen_error:
-            return
-        if not self.bot_id or self.bot_id not in self.tokens:
-            logger.info("Twitch is not linked. Use Link Twitch in the status window.")
-            self.status.mark_twitch_unlinked()
+        serving = await self._oauth_page_is_up()
+        if serving and not self._listening and not self._listen_error:
+            if not self.bot_id or self.bot_id not in self.tokens:
+                logger.info("Twitch is not linked. Use Link Twitch in the status window.")
+                self.status.mark_twitch_unlinked()
+        elif not serving and not self._listening:
+            logger.error("The Twitch login page did not start.")
+            self.status.mark_twitch_error("Twitch login could not start. Try Link Twitch again.", can_link=True)
+        if self._report_oauth is not None:
+            self._report_oauth(serving)
+
+    async def _oauth_page_is_up(self) -> bool:
+        """True once the local sign-in page has bound its port.
+
+        TwitchIO marks the client ready before that bind finishes, and a failed
+        bind only shows up on the background task. Relinking has to talk to the
+        page that is actually listening.
+        """
+        task = getattr(self._adapter, "_runner_task", None)
+        if task is None:
+            return False
+        try:
+            # shield keeps a slow bind alive; wait_for would cancel the server.
+            await asyncio.wait_for(asyncio.shield(task), timeout=5)
+        except Exception:
+            logger.exception("The Twitch login page did not start")
+            return False
+        return True
 
     async def event_oauth_authorized(self, payload: twitchio.authentication.UserTokenPayload) -> None:
         if not payload.user_id:
@@ -111,14 +136,22 @@ class Autoreply(twitchio.Client):
             logger.error(message)
             self.status.mark_twitch_error(message, can_link=True)
             return
-        await self.add_token(payload.access_token, payload.refresh_token)
-        await self.save_tokens()
+        try:
+            await self.add_token(payload.access_token, payload.refresh_token)
+            await self.save_tokens()
+        except Exception:
+            logger.exception("Could not save the Twitch login")
+            self.status.mark_twitch_error(
+                "Twitch signed in, but the login was not saved. Try Link Twitch again.",
+                can_link=True,
+            )
+            return
         self._bot_id = payload.user_id
         self._account_id = payload.user_id
         if payload.user_login:
             self.account = payload.user_login
         logger.info("Twitch login saved for %s.", self.account or payload.user_id)
-        await self._listen()
+        await self._listen(required=True)
 
     async def event_token_refreshed(self, payload: twitchio.TokenRefreshedPayload) -> None:
         del payload
@@ -229,8 +262,12 @@ class Autoreply(twitchio.Client):
             return handler()
         return "That command is not set up."
 
-    async def _listen(self) -> None:
+    async def _listen(self, *, required: bool = False) -> None:
         if not self.bot_id or self.bot_id not in self.tokens:
+            if required:
+                message = "Twitch signed in, but the login was not saved. Try Link Twitch again."
+                logger.error(message)
+                self.status.mark_twitch_error(message, can_link=True)
             return
         if self._listening:
             await self._listen_for_song_requests()
@@ -245,6 +282,11 @@ class Autoreply(twitchio.Client):
             )
         except HTTPException:
             self._listen_error = "Twitch did not allow chat access. Link the account again."
+            logger.exception(self._listen_error)
+            self.status.mark_twitch_error(self._listen_error, can_link=True)
+            return
+        except Exception:
+            self._listen_error = "Twitch signed in, but chat did not connect. Try Link Twitch again."
             logger.exception(self._listen_error)
             self.status.mark_twitch_error(self._listen_error, can_link=True)
             return

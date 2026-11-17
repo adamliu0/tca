@@ -13,8 +13,10 @@ class StatusRowTests(unittest.TestCase):
         self.assertEqual(rows["Program"].value, "Waiting")
         self.assertEqual(rows["Twitch"].button, "Link Twitch")
         self.assertTrue(rows["Twitch"].button_enabled)
+        self.assertIsNone(rows["Twitch"].unlink)
         self.assertEqual(rows["Spotify"].button, "Link Spotify")
         self.assertTrue(rows["Spotify"].button_enabled)
+        self.assertIsNone(rows["Spotify"].unlink)
         self.assertIsNone(rows["Program"].button)
 
     def test_running_and_connected_hides_buttons(self) -> None:
@@ -30,6 +32,10 @@ class StatusRowTests(unittest.TestCase):
         self.assertEqual(rows["Spotify"].value, "Connected")
         self.assertIsNone(rows["Twitch"].button)
         self.assertIsNone(rows["Spotify"].button)
+        self.assertEqual(rows["Twitch"].unlink, "Unlink")
+        self.assertTrue(rows["Twitch"].unlink_enabled)
+        self.assertEqual(rows["Spotify"].unlink, "Unlink")
+        self.assertTrue(rows["Spotify"].unlink_enabled)
 
     def test_spotify_link_in_progress_disables_the_button(self) -> None:
         status = AppStatus()
@@ -50,9 +56,11 @@ class StatusRowTests(unittest.TestCase):
         self.assertEqual(rows["Program"].value, "Running")
         self.assertEqual(rows["Twitch"].value, "Connected")
         self.assertEqual(rows["Twitch"].button, "Link again")
+        self.assertEqual(rows["Twitch"].unlink, "Unlink")
         self.assertIn("song requests", rows["Twitch"].detail)
         self.assertEqual(rows["Spotify"].value, "Connected")
         self.assertEqual(rows["Spotify"].button, "Link again")
+        self.assertEqual(rows["Spotify"].unlink, "Unlink")
 
     def test_problem_offers_link_again(self) -> None:
         status = AppStatus()
@@ -61,7 +69,9 @@ class StatusRowTests(unittest.TestCase):
         rows = {row.name: row for row in status_rows(status.snapshot())}
         self.assertEqual(rows["Program"].value, "Not running")
         self.assertEqual(rows["Twitch"].button, "Link again")
+        self.assertEqual(rows["Twitch"].unlink, "Unlink")
         self.assertEqual(rows["Spotify"].button, "Link again")
+        self.assertEqual(rows["Spotify"].unlink, "Unlink")
 
     def test_missing_configuration_has_no_link_buttons(self) -> None:
         status = AppStatus()

@@ -84,29 +84,23 @@ def format_song(playback: dict | None) -> str:
 
 
 def format_playlist(playback: dict | None, playlist_name: str | None) -> str:
-    if not playback:
-        return "Nothing is playing on Spotify right now."
+    # Spotify keeps the previous playlist on this payload after pause, stop,
+    # or a switch to something that is not a playlist.
+    url = _active_playlist_url(playback)
+    if not url:
+        return "Currently not listening to a playlist"
+    if playlist_name:
+        return f"Playlist: {playlist_name} — {url}"
+    return f"Playlist: {url}"
 
+
+def _active_playlist_url(playback: dict | None) -> str | None:
+    if not playback or playback.get("is_playing") is not True:
+        return None
     context = playback.get("context") or {}
-    context_type = context.get("type")
+    if context.get("type") != "playlist":
+        return None
     url = (context.get("external_urls") or {}).get("spotify")
-    url = url if isinstance(url, str) and url else None
-    paused = "Spotify is paused. " if playback.get("is_playing") is False else ""
-
-    if context_type == "playlist" and url:
-        if playlist_name:
-            return f"{paused}Playlist: {playlist_name} — {url}"
-        return f"{paused}Playlist: {url}"
-    if context_type == "album" and url:
-        return f"{paused}This is playing from an album, not a playlist: {url}"
-    if context_type == "artist" and url:
-        return f"{paused}This is playing from an artist, not a playlist: {url}"
-    if context_type == "collection":
-        return f"{paused}This is playing from Liked Songs, not a playlist."
-    if context_type == "show":
-        return f"{paused}This is playing from a podcast, not a playlist."
-    if url:
-        return f"{paused}This is not playing from a playlist: {url}"
-    if not playback.get("item") and not playback.get("is_playing"):
-        return "Nothing is playing on Spotify right now."
-    return f"{paused}Nothing is playing from a playlist right now."
+    if isinstance(url, str) and url:
+        return url
+    return None

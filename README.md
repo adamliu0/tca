@@ -12,7 +12,7 @@ The program has to be running to answer. Your PC has to be on and awake. You do 
 
 A small status window shows whether the program is running and whether Twitch and Spotify are connected. The first launch asks for a Twitch application and a Spotify application in that window. Twitch and Spotify require those applications to be created on their websites. The window opens the right page, copies the redirect URL, and saves what you paste. After the Twitch application is saved, Link Twitch is the sign-in, and the account that signs in is the channel. Spotify is an app on the Spotify account that plays the music, then a sign-in.
 
-When an account is not connected, use its Link button. The browser opens for that sign-in. The window does not take your keyboard or mouse, so leave it in the background while you play.
+When an account is not connected, use its Link button. The browser opens for that sign-in. Unlink signs that account out and leaves the saved client ID and secret in place, so Link can be used again. Those boxes stay on the window whether the account is linked or not. The characters stay hidden until the eye beside the box is clicked, and Copy places the saved value on the clipboard. The window does not take your keyboard or mouse, so leave it in the background while you play.
 
 Spotify can be playing on your PC, phone, or any other device on the same Spotify account. Close the status window when you are done. If you are using the console, press Ctrl+C once and wait a few seconds.
 
@@ -60,11 +60,19 @@ Examples:
 
 - `!song` → `Now playing: Artist - Title — https://open.spotify.com/track/...`
 - `!playlist` → `Playlist: Name — https://open.spotify.com/playlist/...`
-- `!queue` → `Queue: 1. Song - Artist (requested by viewer) | 2. Song - Artist (requested by viewer)`
+- `!queue` → `Queue: 1. Song - Artist [requested by viewer] | 2. Song - Artist [requested by viewer]`
 
-If nothing is playing, Spotify is paused, or the music is an album, radio, or Liked Songs rather than a playlist, the reply says so. A private Spotify session can hide the track. Spotify's AI DJ sometimes has a playlist link and no name; the link is posted on its own.
+If nothing is playing, Spotify is paused, or the music is an album, radio, or Liked Songs rather than a playlist, `!playlist` replies `Currently not listening to a playlist`. A private Spotify session can hide the track. Spotify's AI DJ sometimes has a playlist link and no name; the link is posted on its own.
 
 Messages show up as you. There is no separate bot name.
+
+## Song widget
+
+While TCA is running it serves a now-playing card at `http://127.0.0.1:8756/`. The status window shows the same card. Copy puts that address on the clipboard so it can be pasted into OBS.
+
+In OBS, add a Browser Source and paste `http://127.0.0.1:8756/`. A source about 520 by 200 leaves room for the rounded corners. Leave "Shutdown source when not visible" off, and leave TCA running. The page background is transparent. Other localhost browser sources stay separate because they use a different port. The address does not change between launches. If port 8756 is already taken, the status window says so.
+
+The card shows the album picture on the left, then the song, the artist, and a progress bar. If Spotify's API does not report the song, the card uses the Spotify app playing on this PC. The card background is a blurred gradient taken from the album picture. `Requested by` is added when the current song is a viewer's request that has just started. An ad, a podcast, or nothing playing leaves the OBS source empty. The window then shows "Nothing is playing" in the same card.
 
 ## Song requests
 

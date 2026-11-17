@@ -38,16 +38,16 @@ class RequestQueueTests(unittest.TestCase):
         )
         self.assertEqual(
             text,
-            "Queue: 1. Midnight - Nova (requested by ada) | 2. Daylight - Nova (requested by bea)",
+            "Queue: 1. Midnight - Nova [requested by ada] | 2. Daylight - Nova [requested by bea]",
         )
 
     def test_empty_queue(self) -> None:
         self.assertEqual(format_request_queue([]), "No song requests are waiting.")
 
-    def test_requested_by_touches_the_closing_parenthesis(self) -> None:
+    def test_requested_by_touches_the_closing_bracket(self) -> None:
         text = format_request_queue([SongRequest("a", "Midnight", "Nova", "ada ")])
-        self.assertIn("(requested by ada)", text)
-        self.assertNotIn("ada )", text)
+        self.assertIn("[requested by ada]", text)
+        self.assertNotIn("ada ]", text)
 
     def test_format_stays_within_the_chat_limit(self) -> None:
         waiting = [

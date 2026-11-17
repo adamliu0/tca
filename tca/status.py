@@ -26,6 +26,8 @@ class StatusRow:
     tone: str
     button: str | None = None
     button_enabled: bool = False
+    unlink: str | None = None
+    unlink_enabled: bool = False
 
 
 class AppStatus:
@@ -192,10 +194,30 @@ def status_rows(snapshot: Snapshot) -> list[StatusRow]:
         snapshot.spotify_can_link,
         "Link Spotify",
     )
+    twitch_unlink, twitch_unlink_enabled = _unlink_button(snapshot.twitch_state)
+    spotify_unlink, spotify_unlink_enabled = _unlink_button(snapshot.spotify_state)
     return [
         StatusRow("Program", program_value, snapshot.detail, program_tone),
-        StatusRow("Twitch", twitch_value, snapshot.twitch_detail, twitch_tone, twitch_button, twitch_enabled),
-        StatusRow("Spotify", spotify_value, snapshot.spotify_detail, spotify_tone, spotify_button, spotify_enabled),
+        StatusRow(
+            "Twitch",
+            twitch_value,
+            snapshot.twitch_detail,
+            twitch_tone,
+            twitch_button,
+            twitch_enabled,
+            twitch_unlink,
+            twitch_unlink_enabled,
+        ),
+        StatusRow(
+            "Spotify",
+            spotify_value,
+            snapshot.spotify_detail,
+            spotify_tone,
+            spotify_button,
+            spotify_enabled,
+            spotify_unlink,
+            spotify_unlink_enabled,
+        ),
     ]
 
 
@@ -206,4 +228,10 @@ def _link_button(state: str, can_link: bool, label: str) -> tuple[str | None, bo
         return label, True
     if can_link and state in {"error", "connected"}:
         return "Link again", True
+    return None, False
+
+
+def _unlink_button(state: str) -> tuple[str | None, bool]:
+    if state in {"connected", "error"}:
+        return "Unlink", True
     return None, False
